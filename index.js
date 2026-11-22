@@ -9,10 +9,14 @@ const app = express();
 const port = process.env.PORT || 8000;
 
 // Better Auth JWT verification
+const BETTER_AUTH_URL = process.env.BETTER_AUTH_URL?.replace(/\/$/, "");
+
+if (!BETTER_AUTH_URL) {
+    throw new Error("BETTER_AUTH_URL is missing.");
+}
+
 const JWKS = createRemoteJWKSet(
-    new URL(
-        `${process.env.BETTER_AUTH_URL.replace(/\/$/, "")}/api/auth/jwks`
-    )
+    new URL(`${BETTER_AUTH_URL}/api/auth/jwks`)
 );
 
 // CORS
@@ -101,17 +105,10 @@ async function verifyToken(req, res, next) {
 
     try {
         const token = authHeader.slice(7);
-        const payloadPart = token.split(".")[1];
-        const decodedPayload = JSON.parse(
-            Buffer.from(payloadPart, "base64url").toString()
-        );
-
-        console.log("JWT issuer:", decodedPayload.iss);
-        console.log("Backend expected issuer:", process.env.BETTER_AUTH_URL);
 
         const { payload } = await jwtVerify(token, JWKS, {
-            issuer: process.env.BETTER_AUTH_URL.replace(/\/$/, ""),
-            audience: process.env.BETTER_AUTH_URL.replace(/\/$/, ""),
+            issuer: BETTER_AUTH_URL,
+            audience: BETTER_AUTH_URL,
         });
 
         if (!payload.sub || !payload.email) {
@@ -121,7 +118,6 @@ async function verifyToken(req, res, next) {
             });
         }
 
-        // Get current user role from database
         const user = await users().findOne({
             $or: [
                 { _id: payload.sub },
@@ -139,6 +135,7 @@ async function verifyToken(req, res, next) {
         req.user = {
             id: payload.sub,
             email: payload.email,
+            name: user.name || user.fullName || "Tutor",
             role: user.role,
         };
 
@@ -161,6 +158,7 @@ function verifyStudent(req, res, next) {
             message: "Student access only.",
         });
     }
+
     next();
 }
 
@@ -171,6 +169,7 @@ function verifyTutor(req, res, next) {
             message: "Tutor access only.",
         });
     }
+
     next();
 }
 
@@ -181,6 +180,7 @@ function verifyAdmin(req, res, next) {
             message: "Admin access only.",
         });
     }
+
     next();
 }
 
@@ -330,6 +330,581 @@ app.get("/tuitions/:id", async (req, res) => {
     }
 });
 
+
+
+// API: Create a tuition (Tutors only)
+app.post("/tuitions", verifyToken, verifyTutor, async (req, res) => {
+    try {
+        const {
+            title,
+            subject,
+            classLevel,
+            mode,
+            location,
+            salary,
+            daysPerWeek,
+            description,
+            schedule,
+            bannerImage,
+        } = req.body;
+
+        if (
+            typeof title !== "string" || !title.trim() ||
+            typeof subject !== "string" || !subject.trim() ||
+            typeof classLevel !== "string" || !classLevel.trim() ||
+            typeof mode !== "string" || !mode.trim() ||
+            !Number.isFinite(Number(salary)) || Number(salary) <= 0 ||
+            !Number.isInteger(Number(daysPerWeek)) ||
+            Number(daysPerWeek) < 1 || Number(daysPerWeek) > 7
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Please provide valid tuition information.",
+            });
+        }
+
+        const tutor = await users().findOne({
+            email: req.user.email,
+        });
+
+        const plan = String(
+            tutor?.plan || tutor?.subscriptionPlan || "free"
+        ).toLowerCase();
+
+        const isPro = plan === "pro";
+
+        if (!isPro) {
+            const existingPosts = await tuitions().countDocuments({
+                tutorId: req.user.id,
+            });
+
+            if (existingPosts >= 2) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Free Plan allows a maximum of 2 tuition posts. Upgrade to Pro for unlimited posts.",
+                    code: "FREE_PLAN_LIMIT",
+                });
+            }
+        }
+
+        const tuition = {
+            title: title.trim(),
+            subject: subject.trim(),
+            classLevel: classLevel.trim(),
+            mode: mode.trim(),
+            location: typeof location === "string" ? location.trim() : "",
+            salary: Number(salary),
+            daysPerWeek: Number(daysPerWeek),
+            description: typeof description === "string" ? description.trim() : "",
+            schedule: typeof schedule === "string" ? schedule.trim() : "",
+            bannerImage: typeof bannerImage === "string" ? bannerImage : "",
+            tutorId: req.user.id,
+            tutorName: req.user.name,
+            tutorEmail: req.user.email,
+            approvalStatus: "pending",
+            status: "active",
+            createdAt: new Date(),
+            updatedAt: new Date(),
+        };
+
+        const result = await tuitions().insertOne(tuition);
+
+        res.status(201).json({
+            success: true,
+            message: "Tuition posted successfully. Awaiting admin approval.",
+            data: {
+                ...tuition,
+                id: result.insertedId.toString(),
+            },
+        });
+    } catch (error) {
+        console.error("Error creating tuition:", error);
+
+        res.status(500).json({
+            success: false,
+            message: "Failed to create tuition.",
+        });
+    }
+});
+
+
+// ==========================================
+// TUTOR DASHBOARD APIs
+// ==========================================
+
+// API: Tutor dashboard overview
+app.get("/tutor/dashboard", verifyToken, verifyTutor, async (req, res) => {
+    try {
+        const tutorTuitions = await tuitions()
+            .find({ tutorId: req.user.id })
+            .toArray();
+
+        const tuitionIds = tutorTuitions.map((item) =>
+            item._id.toString()
+        );
+
+        const totalApplicants = tuitionIds.length
+            ? await applications().countDocuments({
+                tuitionId: { $in: tuitionIds },
+            })
+            : 0;
+
+        const tutor = await users().findOne(
+            { email: req.user.email },
+            { projection: { plan: 1, subscriptionPlan: 1 } }
+        );
+
+        const plan = String(
+            tutor?.plan || tutor?.subscriptionPlan || "free"
+        ).toLowerCase();
+
+        res.json({
+            success: true,
+            data: {
+                totalTuitions: tutorTuitions.length,
+                activeTuitions: tutorTuitions.filter(
+                    (item) =>
+                        item.status === "active" &&
+                        item.approvalStatus === "approved"
+                ).length,
+                totalApplicants,
+                currentPlan: plan === "pro" ? "Pro" : "Free",
+            },
+        });
+    } catch (error) {
+        console.error("Tutor dashboard error:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch tutor dashboard.",
+        });
+    }
+});
+
+
+// API: Get tutor's own tuition posts
+app.get("/tutor/tuitions", verifyToken, verifyTutor, async (req, res) => {
+    try {
+        const results = await tuitions()
+            .find({ tutorId: req.user.id })
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        res.json({
+            success: true,
+            data: results.map((item) => ({
+                ...item,
+                id: item._id.toString(),
+            })),
+        });
+    } catch (error) {
+        console.error("Get tutor tuitions error:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch your tuitions.",
+        });
+    }
+});
+
+
+// API: Update tuition details
+app.patch("/tutor/tuitions/:id", verifyToken, verifyTutor, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid tuition ID.",
+            });
+        }
+
+        const existing = await tuitions().findOne({
+            _id: new ObjectId(id),
+            tutorId: req.user.id,
+        });
+
+        if (!existing) {
+            return res.status(404).json({
+                success: false,
+                message: "Tuition not found.",
+            });
+        }
+
+        const allowedFields = [
+            "title",
+            "subject",
+            "classLevel",
+            "mode",
+            "location",
+            "salary",
+            "daysPerWeek",
+            "description",
+            "schedule",
+            "bannerImage",
+        ];
+
+        const updates = {};
+
+        for (const field of allowedFields) {
+            if (req.body[field] !== undefined) {
+                updates[field] = req.body[field];
+            }
+        }
+
+        if (!Object.keys(updates).length) {
+            return res.status(400).json({
+                success: false,
+                message: "No valid fields provided.",
+            });
+        }
+
+        for (const field of ["title", "subject", "classLevel", "mode"]) {
+            if (
+                updates[field] !== undefined &&
+                (typeof updates[field] !== "string" ||
+                    !updates[field].trim())
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: `${field} is required.`,
+                });
+            }
+
+            if (typeof updates[field] === "string") {
+                updates[field] = updates[field].trim();
+            }
+        }
+
+        if (updates.salary !== undefined) {
+            updates.salary = Number(updates.salary);
+
+            if (!Number.isFinite(updates.salary) || updates.salary <= 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Monthly fee must be greater than zero.",
+                });
+            }
+        }
+
+        if (updates.daysPerWeek !== undefined) {
+            updates.daysPerWeek = Number(updates.daysPerWeek);
+
+            if (
+                !Number.isInteger(updates.daysPerWeek) ||
+                updates.daysPerWeek < 1 ||
+                updates.daysPerWeek > 7
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Days per week must be between 1 and 7.",
+                });
+            }
+        }
+
+        if (
+            updates.bannerImage !== undefined &&
+            typeof updates.bannerImage !== "string"
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid banner image.",
+            });
+        }
+
+        // Re-approval is required after editing tuition details.
+        if (existing.approvalStatus === "approved") {
+            updates.approvalStatus = "pending";
+        }
+
+        updates.updatedAt = new Date();
+
+        await tuitions().updateOne(
+            {
+                _id: new ObjectId(id),
+                tutorId: req.user.id,
+            },
+            { $set: updates }
+        );
+
+        res.json({
+            success: true,
+            message: "Tuition updated successfully.",
+        });
+    } catch (error) {
+        console.error("Update tuition error:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to update tuition.",
+        });
+    }
+});
+
+
+// API: Toggle tuition status (Active / Closed)
+app.patch(
+    "/tutor/tuitions/:id/status",
+    verifyToken,
+    verifyTutor,
+    async (req, res) => {
+        try {
+            const { id } = req.params;
+            const { status } = req.body;
+
+            if (!ObjectId.isValid(id)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid tuition ID.",
+                });
+            }
+
+            if (!["active", "closed"].includes(status)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Status must be active or closed.",
+                });
+            }
+
+            const result = await tuitions().updateOne(
+                {
+                    _id: new ObjectId(id),
+                    tutorId: req.user.id,
+                },
+                {
+                    $set: {
+                        status,
+                        updatedAt: new Date(),
+                    },
+                }
+            );
+
+            if (!result.matchedCount) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Tuition not found.",
+                });
+            }
+
+            res.json({
+                success: true,
+                message: `Tuition ${status} successfully.`,
+            });
+        } catch (error) {
+            console.error("Toggle tuition status error:", error);
+            res.status(500).json({
+                success: false,
+                message: "Failed to update tuition status.",
+            });
+        }
+    }
+);
+
+
+// API: Delete tuition post
+app.delete("/tutor/tuitions/:id", verifyToken, verifyTutor, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid tuition ID.",
+            });
+        }
+
+        const tuitionId = id;
+
+        const result = await tuitions().deleteOne({
+            _id: new ObjectId(id),
+            tutorId: req.user.id,
+        });
+
+        if (!result.deletedCount) {
+            return res.status(404).json({
+                success: false,
+                message: "Tuition not found.",
+            });
+        }
+
+        await applications().deleteMany({ tuitionId });
+
+        res.json({
+            success: true,
+            message: "Tuition and related applications deleted.",
+        });
+    } catch (error) {
+        console.error("Delete tuition error:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to delete tuition.",
+        });
+    }
+});
+
+
+// API: Get applicants for tutor's tuition posts
+app.get("/tutor/applicants", verifyToken, verifyTutor, async (req, res) => {
+    try {
+        const tutorTuitions = await tuitions()
+            .find({ tutorId: req.user.id })
+            .toArray();
+
+        const tuitionMap = new Map(
+            tutorTuitions.map((item) => [
+                item._id.toString(),
+                item,
+            ])
+        );
+
+        const tuitionIds = [...tuitionMap.keys()];
+
+        if (!tuitionIds.length) {
+            return res.json({
+                success: true,
+                data: [],
+            });
+        }
+
+        const results = await applications()
+            .find({ tuitionId: { $in: tuitionIds } })
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        const data = await Promise.all(
+            results.map(async (application) => {
+                const student = await users().findOne(
+                    { email: application.studentEmail },
+                    {
+                        projection: {
+                            name: 1,
+                            fullName: 1,
+                            email: 1,
+                        },
+                    }
+                );
+
+                const tuition = tuitionMap.get(application.tuitionId);
+
+                return {
+                    id: application._id.toString(),
+                    tuitionId: application.tuitionId,
+                    tuitionTitle: tuition?.title || "Tuition",
+                    studentName:
+                        student?.name ||
+                        student?.fullName ||
+                        "Student",
+                    studentEmail:
+                        student?.email ||
+                        application.studentEmail ||
+                        "",
+                    phone: application.phone || "",
+                    preferredSchedule:
+                        application.preferredSchedule || "",
+                    learningNote: application.learningNote || "",
+                    status: application.status,
+                    createdAt: application.createdAt,
+                };
+            })
+        );
+
+        res.json({
+            success: true,
+            data,
+        });
+    } catch (error) {
+        console.error("Tutor applicants error:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch applicants.",
+        });
+    }
+});
+
+
+// API: Accept or reject an applicant
+app.patch(
+    "/tutor/applications/:id/status",
+    verifyToken,
+    verifyTutor,
+    async (req, res) => {
+        try {
+            const { id } = req.params;
+            const { status } = req.body;
+
+            if (!ObjectId.isValid(id)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid application ID.",
+                });
+            }
+
+            if (!["accepted", "rejected"].includes(status)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Status must be accepted or rejected.",
+                });
+            }
+
+            const application = await applications().findOne({
+                _id: new ObjectId(id),
+            });
+
+            if (!application) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Application not found.",
+                });
+            }
+
+            const tuition = await tuitions().findOne({
+                _id: ObjectId.isValid(application.tuitionId)
+                    ? new ObjectId(application.tuitionId)
+                    : null,
+                tutorId: req.user.id,
+            });
+
+            if (!tuition) {
+                return res.status(403).json({
+                    success: false,
+                    message: "You cannot manage this application.",
+                });
+            }
+
+            if (application.status !== "pending") {
+                return res.status(409).json({
+                    success: false,
+                    message: "Only pending applications can be updated.",
+                });
+            }
+
+            await applications().updateOne(
+                {
+                    _id: new ObjectId(id),
+                    status: "pending",
+                },
+                {
+                    $set: {
+                        status,
+                        updatedAt: new Date(),
+                    },
+                }
+            );
+
+            res.json({
+                success: true,
+                message: `Application ${status} successfully.`,
+            });
+        } catch (error) {
+            console.error("Update applicant status error:", error);
+            res.status(500).json({
+                success: false,
+                message: "Failed to update application status.",
+            });
+        }
+    }
+);
+
+
+
 // API 3: Apply for a tuition (Students only)
 app.post("/applications", verifyToken, verifyStudent, async (req, res) => {
     try {
@@ -340,7 +915,6 @@ app.post("/applications", verifyToken, verifyStudent, async (req, res) => {
             learningNote = "",
         } = req.body;
 
-        // Validate required fields
         if (
             !tuitionId ||
             !phone?.trim() ||
@@ -359,7 +933,6 @@ app.post("/applications", verifyToken, verifyStudent, async (req, res) => {
             });
         }
 
-        // Check whether tuition exists and is available
         const tuition = await tuitions().findOne({
             _id: new ObjectId(tuitionId),
             ...publicTuitionFilter,
@@ -372,7 +945,6 @@ app.post("/applications", verifyToken, verifyStudent, async (req, res) => {
             });
         }
 
-        // Prevent duplicate applications
         await applications().createIndex(
             { tuitionId: 1, studentId: 1 },
             { unique: true }
@@ -427,6 +999,245 @@ app.post("/applications", verifyToken, verifyStudent, async (req, res) => {
         });
     }
 });
+
+// API 4: Student dashboard overview
+app.get("/student/dashboard", verifyToken, verifyStudent, async (req, res) => {
+    try {
+        const student = await users().findOne(
+            { email: req.user.email },
+            {
+                projection: {
+                    plan: 1,
+                    subscriptionPlan: 1,
+                },
+            }
+        );
+
+        const studentApplications = await applications()
+            .find({ studentId: req.user.id })
+            .toArray();
+
+        const activeApplications = studentApplications.filter(
+            (application) => application.status !== "cancelled"
+        );
+
+        const plan = String(
+            student?.plan ||
+            student?.subscriptionPlan ||
+            "free"
+        ).toLowerCase();
+
+        res.status(200).json({
+            success: true,
+            data: {
+                totalAppliedTuitions: activeApplications.length,
+                acceptedApplications: activeApplications.filter(
+                    (application) => application.status === "accepted"
+                ).length,
+                pendingApplications: activeApplications.filter(
+                    (application) => application.status === "pending"
+                ).length,
+                currentPlan: plan === "pro" ? "Pro" : "Free",
+            },
+        });
+    } catch (error) {
+        console.error("Error fetching student dashboard:", error);
+
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch student dashboard.",
+        });
+    }
+});
+
+// API 5: Get student's applications with tuition and tutor details
+app.get("/student/applications", verifyToken, verifyStudent, async (req, res) => {
+    try {
+        const results = await applications()
+            .aggregate([
+                {
+                    $match: {
+                        studentId: req.user.id,
+                    },
+                },
+                {
+                    $addFields: {
+                        tuitionObjectId: {
+                            $convert: {
+                                input: "$tuitionId",
+                                to: "objectId",
+                                onError: null,
+                                onNull: null,
+                            },
+                        },
+                    },
+                },
+                {
+                    $lookup: {
+                        from: "tuitions",
+                        localField: "tuitionObjectId",
+                        foreignField: "_id",
+                        as: "tuition",
+                    },
+                },
+                {
+                    $unwind: {
+                        path: "$tuition",
+                        preserveNullAndEmptyArrays: true,
+                    },
+                },
+                {
+                    $sort: {
+                        createdAt: -1,
+                    },
+                },
+                {
+                    $project: {
+                        _id: 0,
+                        id: { $toString: "$_id" },
+                        tuitionId: 1,
+                        status: 1,
+                        createdAt: 1,
+                        preferredSchedule: 1,
+                        tuition: {
+                            id: { $toString: "$tuition._id" },
+                            title: "$tuition.title",
+                            monthlyFee: {
+                                $ifNull: [
+                                    "$tuition.monthlyFee",
+                                    "$tuition.salary",
+                                ],
+                            },
+                            tutorId: "$tuition.tutorId",
+                            tutorEmail: "$tuition.tutorEmail",
+                            tutorName: "$tuition.tutorName",
+                        },
+                    },
+                },
+            ])
+            .toArray();
+
+        const enrichedResults = await Promise.all(
+            results.map(async (application) => {
+                const tuition = application.tuition || {};
+                let tutor = null;
+
+                const tutorQuery = [];
+
+                if (tuition.tutorEmail) {
+                    tutorQuery.push({
+                        email: tuition.tutorEmail,
+                    });
+                }
+
+                if (tuition.tutorId) {
+                    tutorQuery.push({
+                        _id: tuition.tutorId,
+                    });
+
+                    if (ObjectId.isValid(String(tuition.tutorId))) {
+                        tutorQuery.push({
+                            _id: new ObjectId(String(tuition.tutorId)),
+                        });
+                    }
+                }
+
+                if (tutorQuery.length > 0) {
+                    tutor = await users().findOne(
+                        { $or: tutorQuery },
+                        {
+                            projection: {
+                                name: 1,
+                                fullName: 1,
+                                email: 1,
+                            },
+                        }
+                    );
+                }
+
+                return {
+                    ...application,
+                    tuition: {
+                        ...tuition,
+                        tutorName:
+                            tutor?.name ||
+                            tutor?.fullName ||
+                            tuition.tutorName ||
+                            "Tutor",
+                        tutorEmail:
+                            tutor?.email ||
+                            tuition.tutorEmail ||
+                            "",
+                    },
+                };
+            })
+        );
+
+        res.status(200).json({
+            success: true,
+            data: enrichedResults,
+        });
+    } catch (error) {
+        console.error("Error fetching student applications:", error);
+
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch student applications.",
+        });
+    }
+});
+
+// API 6: Cancel a pending student application
+app.patch(
+    "/student/applications/:id/cancel",
+    verifyToken,
+    verifyStudent,
+    async (req, res) => {
+        try {
+            const { id } = req.params;
+
+            if (!ObjectId.isValid(id)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid application ID.",
+                });
+            }
+
+            const result = await applications().updateOne(
+                {
+                    _id: new ObjectId(id),
+                    studentId: req.user.id,
+                    status: "pending",
+                },
+                {
+                    $set: {
+                        status: "cancelled",
+                        updatedAt: new Date(),
+                    },
+                }
+            );
+
+            if (result.matchedCount === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Pending application not found.",
+                });
+            }
+
+            res.status(200).json({
+                success: true,
+                message: "Application cancelled successfully.",
+            });
+        } catch (error) {
+            console.error("Error cancelling application:", error);
+
+            res.status(500).json({
+                success: false,
+                message: "Failed to cancel application.",
+            });
+        }
+    }
+);
 
 // Local development server
 if (!process.env.VERCEL) {
