@@ -20,15 +20,16 @@ const JWKS = createRemoteJWKSet(
 );
 
 // CORS
+const allowedOrigins = [
+  "http://localhost:3000",
+  "https://mentorlagbe-client-sandy.vercel.app",
+];
+
 app.use(
-    cors({
-        origin: [
-            process.env.CLIENT_URL,
-            process.env.PRODUCTION_CLIENT_URL,
-            "http://localhost:3000",
-        ].filter(Boolean),
-        credentials: true,
-    })
+  cors({
+    origin: allowedOrigins,
+    credentials: true,
+  })
 );
 
 app.use(express.json());
