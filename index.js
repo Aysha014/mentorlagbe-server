@@ -1240,6 +1240,279 @@ app.patch(
     }
 );
 
+
+// ==========================================
+// ADMIN DASHBOARD APIs
+// ==========================================
+
+// API 1: Admin dashboard statistics
+app.get("/admin/dashboard", verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const [
+            totalUsers,
+            totalTutors,
+            pendingTuitions,
+            approvedTuitions,
+            totalRevenue,
+        ] = await Promise.all([
+            users().countDocuments(),
+            users().countDocuments({ role: "tutor" }),
+            tuitions().countDocuments({ approvalStatus: "pending" }),
+            tuitions().countDocuments({ approvalStatus: "approved" }),
+            payments().aggregate([
+                {
+                    $group: {
+                        _id: null,
+                        total: {
+                            $sum: {
+                                $convert: {
+                                    input: { $ifNull: ["$amount", 0] },
+                                    to: "double",
+                                    onError: 0,
+                                    onNull: 0,
+                                },
+                            },
+                        },
+                    },
+                },
+            ]).toArray(),
+        ]);
+
+        res.json({
+            success: true,
+            data: {
+                totalUsers,
+                totalTutors,
+                pendingTuitions,
+                approvedTuitions,
+                totalRevenue: totalRevenue[0]?.total || 0,
+            },
+        });
+    } catch (error) {
+        console.error("Admin dashboard error:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch admin dashboard.",
+        });
+    }
+});
+
+
+// API 2: Get all registered users
+app.get("/admin/users", verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const results = await users()
+            .find(
+                {},
+                {
+                    projection: {
+                        name: 1,
+                        fullName: 1,
+                        email: 1,
+                        role: 1,
+                        plan: 1,
+                        createdAt: 1,
+                    },
+                }
+            )
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        res.json({
+            success: true,
+            data: results.map((user) => ({
+                id: user._id.toString(),
+                name: user.name || user.fullName || "User",
+                email: user.email || "",
+                role: user.role || "student",
+                plan: user.plan || "free",
+                createdAt: user.createdAt || null,
+            })),
+        });
+    } catch (error) {
+        console.error("Admin users error:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch users.",
+        });
+    }
+});
+
+
+// API 3: Update a user's role
+app.patch("/admin/users/:id/role", verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { role } = req.body;
+
+        if (!["student", "tutor", "admin"].includes(role)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid user role.",
+            });
+        }
+
+        if (id === req.user.id) {
+            return res.status(400).json({
+                success: false,
+                message: "You cannot change your own admin role.",
+            });
+        }
+
+        const userQuery = [{ _id: id }];
+
+        if (ObjectId.isValid(id)) {
+            userQuery.push({ _id: new ObjectId(id) });
+        }
+
+        const result = await users().updateOne(
+            { $or: userQuery },
+            {
+                $set: {
+                    role,
+                    updatedAt: new Date(),
+                },
+            }
+        );
+
+        if (!result.matchedCount) {
+            return res.status(404).json({
+                success: false,
+                message: "User not found.",
+            });
+        }
+
+        res.json({
+            success: true,
+            message: "User role updated successfully.",
+        });
+    } catch (error) {
+        console.error("Update user role error:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to update user role.",
+        });
+    }
+});
+
+
+// API 4: Get all tuition posts for admin
+app.get("/admin/tuitions", verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const results = await tuitions()
+            .find({})
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        res.json({
+            success: true,
+            data: results.map((tuition) => ({
+                ...tuition,
+                id: tuition._id.toString(),
+            })),
+        });
+    } catch (error) {
+        console.error("Admin tuitions error:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch tuition posts.",
+        });
+    }
+});
+
+
+// API 5: Approve or reject a tuition
+app.patch(
+    "/admin/tuitions/:id/approval",
+    verifyToken,
+    verifyAdmin,
+    async (req, res) => {
+        try {
+            const { id } = req.params;
+            const { approvalStatus } = req.body;
+
+            if (!ObjectId.isValid(id)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid tuition ID.",
+                });
+            }
+
+            if (!["approved", "rejected"].includes(approvalStatus)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Approval status must be approved or rejected.",
+                });
+            }
+
+            const result = await tuitions().updateOne(
+                { _id: new ObjectId(id) },
+                {
+                    $set: {
+                        approvalStatus,
+                        updatedAt: new Date(),
+                    },
+                }
+            );
+
+            if (!result.matchedCount) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Tuition not found.",
+                });
+            }
+
+            res.json({
+                success: true,
+                message: `Tuition ${approvalStatus} successfully.`,
+            });
+        } catch (error) {
+            console.error("Tuition approval error:", error);
+            res.status(500).json({
+                success: false,
+                message: "Failed to update tuition approval.",
+            });
+        }
+    }
+);
+
+
+// API 6: Get Stripe transaction records
+app.get("/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const results = await payments()
+            .find({})
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        res.json({
+            success: true,
+            data: results.map((payment) => ({
+                id: payment._id.toString(),
+                userName: payment.userName || payment.name || "User",
+                email: payment.email || payment.userEmail || "",
+                role: payment.role || "",
+                planName: payment.planName || payment.plan || "",
+                amount: Number(payment.amount) || 0,
+                transactionId:
+                    payment.transactionId ||
+                    payment.paymentIntentId ||
+                    payment.sessionId ||
+                    "",
+                paymentDate: payment.createdAt || payment.paymentDate || null,
+                status: payment.status || "",
+            })),
+        });
+    } catch (error) {
+        console.error("Admin transactions error:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch transactions.",
+        });
+    }
+});
+
+
 // Local development server
 if (!process.env.VERCEL) {
     app.listen(port, () => {
