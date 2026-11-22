@@ -7,56 +7,79 @@ import { MongoClient } from "mongodb";
 const app = express();
 const port = process.env.PORT || 5000;
 
-// Middleware
-app.use(express.json());
+// Allowed frontend origins
+const allowedOrigins = [
+  "http://localhost:3000",
+  process.env.CLIENT_URL,
+].filter(Boolean);
 
+// Middleware
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
     credentials: true,
   })
 );
 
-// MongoDB connection
-const client = new MongoClient(process.env.MONGODB_URI);
+app.use(express.json());
 
-let database;
+// MongoDB connection
+const uri = `mongodb://${process.env.DB_USER}:${process.env.DB_PASSWORD}@ac-bysscth-shard-00-00.rbebje6.mongodb.net:27017,ac-bysscth-shard-00-01.rbebje6.mongodb.net:27017,ac-bysscth-shard-00-02.rbebje6.mongodb.net:27017/?ssl=true&replicaSet=atlas-ijkock-shard-0&authSource=admin`;
+
+const client = new MongoClient(uri);
 
 export async function connectToMongoDB() {
-  await client.connect();
-
-  database = client.db("mentorlagbe");
-
-  console.log("Connected to MongoDB");
-
-  return database;
+  try {
+    await client.connect();
+    console.log("Connected to MongoDB");
+    return client;
+  } catch (error) {
+    console.error("MongoDB connection failed:", error);
+    throw error;
+  }
 }
 
-// Health check
+const connectedClient = await connectToMongoDB();
+
+const database = connectedClient.db("mentorlagbe");
+
+// Application collections
+const users = database.collection("users");
+const tuitions = database.collection("tuitions");
+const applications = database.collection("applications");
+const payments = database.collection("payments");
+
+console.log("MongoDB collections initialized.");
+
+// Root endpoint
 app.get("/", (req, res) => {
   res.send("MentorLagbe API is running!");
 });
 
-// Start server
-async function startServer() {
+// Health check
+app.get("/health", async (req, res) => {
   try {
-    await connectToMongoDB();
+    await database.command({ ping: 1 });
 
-    // Exactly four collections
-    const users = database.collection("users");
-    const tuitions = database.collection("tuitions");
-    const applications = database.collection("applications");
-    const payments = database.collection("payments");
-
-    console.log("Database collections configured");
-
-    app.listen(port, () => {
-      console.log(`MentorLagbe server running on port ${port}`);
+    res.status(200).json({
+      success: true,
+      message: "Server and database are healthy",
     });
   } catch (error) {
-    console.error("Server startup failed:", error);
-    process.exit(1);
+    res.status(500).json({
+      success: false,
+      message: "Database connection failed",
+    });
   }
-}
+});
 
-startServer();
+// Start server
+app.listen(port, () => {
+  console.log(`MentorLagbe server running on port ${port}`);
+});
