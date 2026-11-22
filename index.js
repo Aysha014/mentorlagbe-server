@@ -78,8 +78,4 @@ app.get("/health", async (req, res) => {
     });
   }
 });
-
-// Start server
-app.listen(port, () => {
-  console.log(`MentorLagbe server running on port ${port}`);
-});
+export default app;
