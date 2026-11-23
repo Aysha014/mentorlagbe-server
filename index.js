@@ -1859,6 +1859,192 @@ app.patch(
     }
 );
 
+
+
+
+// ==========================================
+// REVIEW SYSTEM APIs
+// ==========================================
+
+// Get reviews submitted by the logged-in student
+app.get("/student/reviews", verifyToken, verifyStudent, async (req, res) => {
+    try {
+        const tutors = await users()
+            .find(
+                {
+                    role: "tutor",
+                    "reviews.studentId": req.user.id,
+                },
+                {
+                    projection: {
+                        name: 1,
+                        fullName: 1,
+                        reviews: 1,
+                    },
+                }
+            )
+            .toArray();
+
+        const myReviews = tutors.flatMap((tutor) =>
+            (tutor.reviews || [])
+                .filter((review) => review.studentId === req.user.id)
+                .map((review) => ({
+                    ...review,
+                    tutorName:
+                        tutor.name ||
+                        tutor.fullName ||
+                        "Tutor",
+                }))
+        );
+
+        myReviews.sort(
+            (a, b) =>
+                new Date(b.createdAt).getTime() -
+                new Date(a.createdAt).getTime()
+        );
+
+        res.json({
+            success: true,
+            data: myReviews,
+        });
+    } catch (error) {
+        console.error("Get student reviews error:", error);
+
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch your reviews.",
+        });
+    }
+});
+
+
+// Get reviews received by the logged-in tutor
+app.get("/tutor/reviews", verifyToken, verifyTutor, async (req, res) => {
+    try {
+        const tutor = await users().findOne(
+            { email: req.user.email },
+            { projection: { reviews: 1 } }
+        );
+
+        res.json({
+            success: true,
+            data: tutor?.reviews || [],
+        });
+    } catch (error) {
+        console.error("Get tutor reviews error:", error);
+
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch reviews.",
+        });
+    }
+});
+
+
+// Student submits a review for a tutor
+app.post("/reviews", verifyToken, verifyStudent, async (req, res) => {
+    try {
+        const { tuitionId, rating, comment } = req.body;
+
+        if (
+            !ObjectId.isValid(tuitionId) ||
+            !Number.isInteger(rating) ||
+            rating < 1 ||
+            rating > 5 ||
+            typeof comment !== "string" ||
+            !comment.trim()
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Please provide a valid rating and review.",
+            });
+        }
+
+        const application = await applications().findOne({
+            tuitionId,
+            studentId: req.user.id,
+            status: "accepted",
+        });
+
+        if (!application) {
+            return res.status(403).json({
+                success: false,
+                message:
+                    "You can only review a tutor after your application is accepted.",
+            });
+        }
+
+        const tuition = await tuitions().findOne({
+            _id: new ObjectId(tuitionId),
+        });
+
+        if (!tuition?.tutorEmail) {
+            return res.status(404).json({
+                success: false,
+                message: "Tutor not found.",
+            });
+        }
+
+        const tutor = await users().findOne({
+            email: tuition.tutorEmail,
+            role: "tutor",
+        });
+
+        if (!tutor) {
+            return res.status(404).json({
+                success: false,
+                message: "Tutor account not found.",
+            });
+        }
+
+        const existingReview = (tutor.reviews || []).some(
+            (review) =>
+                review.studentId === req.user.id &&
+                review.tuitionId === tuitionId
+        );
+
+        if (existingReview) {
+            return res.status(409).json({
+                success: false,
+                message:
+                    "You have already reviewed this tutor for this tuition.",
+            });
+        }
+
+        const review = {
+            studentId: req.user.id,
+            studentName: req.user.name,
+            tuitionId,
+            tuitionTitle: tuition.title,
+            rating,
+            comment: comment.trim(),
+            createdAt: new Date(),
+        };
+
+        await users().updateOne(
+            { _id: tutor._id },
+            {
+                $push: { reviews: review },
+                $set: { updatedAt: new Date() },
+            }
+        );
+
+        res.status(201).json({
+            success: true,
+            message: "Review submitted successfully.",
+            data: review,
+        });
+    } catch (error) {
+        console.error("Submit review error:", error);
+
+        res.status(500).json({
+            success: false,
+            message: "Failed to submit review.",
+        });
+    }
+});
+
+
 // ==========================================
 // ADMIN DASHBOARD APIs
 // ==========================================
