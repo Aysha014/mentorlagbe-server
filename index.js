@@ -780,6 +780,121 @@ app.get("/tutor/dashboard", verifyToken, verifyTutor, async (req, res) => {
 });
 
 
+
+// API: Get tutor profile
+app.get("/tutor/profile", verifyToken, verifyTutor, async (req, res) => {
+    try {
+        const tutor = await users().findOne(
+            { email: req.user.email },
+            {
+                projection: {
+                    name: 1,
+                    email: 1,
+                    image: 1,
+                    phone: 1,
+                    bio: 1,
+                    subjects: 1,
+                    education: 1,
+                    experience: 1,
+                    location: 1,
+                },
+            }
+        );
+
+        if (!tutor) {
+            return res.status(404).json({
+                success: false,
+                message: "Tutor profile not found.",
+            });
+        }
+
+        res.json({
+            success: true,
+            data: {
+                name: tutor.name || "",
+                email: tutor.email || "",
+                image: tutor.image || "",
+                phone: tutor.phone || "",
+                bio: tutor.bio || "",
+                subjects: tutor.subjects || "",
+                education: tutor.education || "",
+                experience: tutor.experience || "",
+                location: tutor.location || "",
+            },
+        });
+    } catch (error) {
+        console.error("Get tutor profile error:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch tutor profile.",
+        });
+    }
+});
+
+// API: Update tutor profile
+app.patch("/tutor/profile", verifyToken, verifyTutor, async (req, res) => {
+    try {
+        const allowedFields = [
+            "name",
+            "image",
+            "phone",
+            "bio",
+            "subjects",
+            "education",
+            "experience",
+            "location",
+        ];
+
+        const updates = {};
+
+        for (const field of allowedFields) {
+            if (req.body[field] !== undefined) {
+                if (typeof req.body[field] !== "string") {
+                    return res.status(400).json({
+                        success: false,
+                        message: `Invalid ${field} value.`,
+                    });
+                }
+
+                updates[field] = req.body[field].trim();
+            }
+        }
+
+        if (!Object.keys(updates).length) {
+            return res.status(400).json({
+                success: false,
+                message: "No valid profile information provided.",
+            });
+        }
+
+        if (updates.name !== undefined && !updates.name) {
+            return res.status(400).json({
+                success: false,
+                message: "Name is required.",
+            });
+        }
+
+        updates.updatedAt = new Date();
+
+        await users().updateOne(
+            { email: req.user.email },
+            { $set: updates }
+        );
+
+        res.json({
+            success: true,
+            message: "Profile updated successfully.",
+        });
+    } catch (error) {
+        console.error("Update tutor profile error:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to update tutor profile.",
+        });
+    }
+});
+
+
 // API: Get tutor's own tuition posts
 app.get("/tutor/tuitions", verifyToken, verifyTutor, async (req, res) => {
     try {
