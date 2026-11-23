@@ -301,8 +301,34 @@ app.post("/stripe/webhook", async (req, res) => {
         }
 
         // Record successful subscription invoices (including renewals)
-        if (event.type === "invoice.paid") {
-            const invoice = event.data.object;
+
+        if (
+            event.type === "invoice.paid" ||
+            event.type === "invoice_payment.paid"
+        ) {
+            let invoice;
+            let paymentIntentId = "";
+
+            if (event.type === "invoice_payment.paid") {
+                const invoicePayment = event.data.object;
+
+                invoice = await stripe.invoices.retrieve(
+                    invoicePayment.invoice
+                );
+
+                const paymentIntent = invoicePayment.payment?.payment_intent;
+
+                paymentIntentId =
+                    typeof paymentIntent === "string"
+                        ? paymentIntent
+                        : paymentIntent?.id || "";
+            } else {
+                invoice = event.data.object;
+                paymentIntentId =
+                    typeof invoice.payment_intent === "string"
+                        ? invoice.payment_intent
+                        : invoice.payment_intent?.id || "";
+            }
 
             const subscriptionId =
                 typeof invoice.subscription === "string"
@@ -315,6 +341,7 @@ app.post("/stripe/webhook", async (req, res) => {
                 );
 
                 const email = subscription.metadata?.email;
+
                 const user = email
                     ? await users().findOne({ email })
                     : null;
@@ -332,18 +359,25 @@ app.post("/stripe/webhook", async (req, res) => {
                         planName: `${user.role === "student" ? "Student" : "Tutor"} Pro`,
                         amount: (invoice.amount_paid || 0) / 100,
                         currency: invoice.currency || "usd",
-                        transactionId: invoice.payment_intent || invoice.id,
+                        transactionId: paymentIntentId || invoice.id,
                         stripeInvoiceId: invoice.id,
                         stripeSubscriptionId: subscriptionId,
                         sessionId: "",
                         status: "paid",
-                        createdAt: new Date(
-                            (invoice.created || Math.floor(Date.now() / 1000)) * 1000
-                        ),
+                        createdAt: new Date(invoice.created * 1000),
                     });
+
+                    console.log("Payment recorded:", email, invoice.id);
+                } else if (!user) {
+                    console.error("Payment user not found:", email);
+                } else {
+                    console.log("Payment already recorded:", invoice.id);
                 }
+            } else {
+                console.error("Subscription ID missing for invoice:", invoice.id);
             }
         }
+
 
         res.json({ received: true });
     } catch (error) {
