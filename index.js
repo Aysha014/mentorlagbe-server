@@ -1464,6 +1464,212 @@ app.get("/student/dashboard", verifyToken, verifyStudent, async (req, res) => {
     }
 });
 
+
+// ==========================================
+// STUDENT BOOKMARK APIs
+// ==========================================
+
+// Get student's bookmarked tuitions
+app.get("/student/bookmarks", verifyToken, verifyStudent, async (req, res) => {
+    try {
+        const student = await users().findOne(
+            { email: req.user.email },
+            { projection: { bookmarks: 1 } }
+        );
+
+        const bookmarkIds = (student?.bookmarks || [])
+            .filter((id) => ObjectId.isValid(id))
+            .map((id) => new ObjectId(id));
+
+        if (!bookmarkIds.length) {
+            return res.json({
+                success: true,
+                data: [],
+            });
+        }
+
+        const results = await tuitions()
+            .find({
+                _id: { $in: bookmarkIds },
+                ...publicTuitionFilter,
+            })
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        res.json({
+            success: true,
+            data: results.map((item) => ({
+                ...item,
+                id: item._id.toString(),
+            })),
+        });
+    } catch (error) {
+        console.error("Get bookmarks error:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch bookmarks.",
+        });
+    }
+});
+
+// Add a tuition to bookmarks
+app.post(
+    "/student/bookmarks/:tuitionId",
+    verifyToken,
+    verifyStudent,
+    async (req, res) => {
+        try {
+            const { tuitionId } = req.params;
+
+            if (!ObjectId.isValid(tuitionId)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid tuition ID.",
+                });
+            }
+
+            const tuition = await tuitions().findOne({
+                _id: new ObjectId(tuitionId),
+                ...publicTuitionFilter,
+            });
+
+            if (!tuition) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Tuition not found or unavailable.",
+                });
+            }
+
+            const student = await users().findOne({
+                email: req.user.email,
+            });
+
+            if (!student) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Student account not found.",
+                });
+            }
+
+            const bookmarks = student.bookmarks || [];
+
+            if (bookmarks.includes(tuitionId)) {
+                return res.status(409).json({
+                    success: false,
+                    message: "This tuition is already bookmarked.",
+                });
+            }
+
+            const plan = String(
+                student.plan || student.subscriptionPlan || "free"
+            ).toLowerCase();
+
+            const isPro = plan === "pro";
+
+            if (!isPro && bookmarks.length >= 5) {
+                return res.status(403).json({
+                    success: false,
+                    code: "BOOKMARK_LIMIT",
+                    message: "Free Plan allows a maximum of 5 bookmarks. Upgrade to Pro for unlimited bookmarks.",
+                });
+            }
+
+            const filter = { email: req.user.email };
+
+            // Enforce the free-plan limit in the database update too.
+            if (!isPro) {
+                filter.$expr = {
+                    $lt: [
+                        { $size: { $ifNull: ["$bookmarks", []] } },
+                        5,
+                    ],
+                };
+            }
+
+            const result = await users().updateOne(
+                filter,
+                {
+                    $addToSet: {
+                        bookmarks: tuitionId,
+                    },
+                    $set: {
+                        updatedAt: new Date(),
+                    },
+                }
+            );
+
+            if (!result.matchedCount) {
+                return res.status(403).json({
+                    success: false,
+                    code: "BOOKMARK_LIMIT",
+                    message: "You have reached the 5-bookmark free-plan limit.",
+                });
+            }
+
+            res.json({
+                success: true,
+                message: "Tuition bookmarked successfully.",
+            });
+        } catch (error) {
+            console.error("Add bookmark error:", error);
+            res.status(500).json({
+                success: false,
+                message: "Failed to bookmark tuition.",
+            });
+        }
+    }
+);
+
+// Remove a tuition from bookmarks
+app.delete(
+    "/student/bookmarks/:tuitionId",
+    verifyToken,
+    verifyStudent,
+    async (req, res) => {
+        try {
+            const { tuitionId } = req.params;
+
+            if (!ObjectId.isValid(tuitionId)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid tuition ID.",
+                });
+            }
+
+            const result = await users().updateOne(
+                { email: req.user.email },
+                {
+                    $pull: {
+                        bookmarks: tuitionId,
+                    },
+                    $set: {
+                        updatedAt: new Date(),
+                    },
+                }
+            );
+
+            if (!result.matchedCount) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Student account not found.",
+                });
+            }
+
+            res.json({
+                success: true,
+                message: "Bookmark removed successfully.",
+            });
+        } catch (error) {
+            console.error("Remove bookmark error:", error);
+            res.status(500).json({
+                success: false,
+                message: "Failed to remove bookmark.",
+            });
+        }
+    }
+);
+
+
 // API 5: Get student's applications with tuition and tutor details
 app.get("/student/applications", verifyToken, verifyStudent, async (req, res) => {
     try {
