@@ -4,9 +4,14 @@ import "dotenv/config";
 import { MongoClient, ObjectId } from "mongodb";
 import cors from "cors";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import Stripe from "stripe";
 
 const app = express();
 const port = process.env.PORT || 8000;
+
+const stripe = process.env.STRIPE_SECRET_KEY
+    ? new Stripe(process.env.STRIPE_SECRET_KEY)
+    : null;
 
 // Better Auth JWT verification
 const BETTER_AUTH_URL = process.env.BETTER_AUTH_URL?.replace(/\/$/, "");
@@ -21,18 +26,26 @@ const JWKS = createRemoteJWKSet(
 
 // CORS
 const allowedOrigins = [
-  "http://localhost:3000",
-  "https://mentorlagbe-client-sandy.vercel.app",
+    "http://localhost:3000",
+    "https://mentorlagbe-client-sandy.vercel.app",
 ];
 
 app.use(
-  cors({
-    origin: allowedOrigins,
-    credentials: true,
-  })
+    cors({
+        origin: allowedOrigins,
+        credentials: true,
+    })
 );
 
-app.use(express.json());
+app.use(
+    express.json({
+        verify: (req, res, buf) => {
+            if (req.originalUrl === "/stripe/webhook") {
+                req.rawBody = buf;
+            }
+        },
+    })
+);
 
 // MongoDB connection
 const uri = process.env.MONGODB_URI;
@@ -92,6 +105,257 @@ const users = () => db.collection("users");
 const tuitions = () => db.collection("tuitions");
 const applications = () => db.collection("applications");
 const payments = () => db.collection("payments");
+
+
+// ==========================================
+// STRIPE SUBSCRIPTION APIs
+// ==========================================
+
+// Create monthly subscription checkout
+app.post("/payments/create-checkout-session", verifyToken, async (req, res) => {
+    try {
+        if (!stripe) {
+            return res.status(500).json({
+                success: false,
+                message: "Stripe is not configured on the server.",
+            });
+        }
+
+        const user = await users().findOne({ email: req.user.email });
+
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: "User account not found.",
+            });
+        }
+
+        const role = user.role;
+        const prices = {
+            student: 1000, // $10/month
+            tutor: 1500,   // $15/month
+        };
+
+        if (!prices[role]) {
+            return res.status(403).json({
+                success: false,
+                message: "Only students and tutors can purchase Pro.",
+            });
+        }
+
+        if (String(user.plan || user.subscriptionPlan || "free").toLowerCase() === "pro") {
+            return res.status(409).json({
+                success: false,
+                message: "You already have a Pro plan.",
+            });
+        }
+
+        const requestOrigin = req.headers.origin;
+
+        const frontendUrl = allowedOrigins.includes(requestOrigin)
+            ? requestOrigin
+            : "https://mentorlagbe-client-sandy.vercel.app";
+
+        const session = await stripe.checkout.sessions.create({
+            mode: "subscription",
+            customer_email: user.email,
+            client_reference_id: req.user.id,
+            line_items: [
+                {
+                    price_data: {
+                        currency: "usd",
+                        unit_amount: prices[role],
+                        recurring: { interval: "month" },
+                        product_data: {
+                            name: `${role === "student" ? "Student" : "Tutor"} Pro`,
+                            description: "MentorLagbe monthly Pro subscription",
+                        },
+                    },
+                    quantity: 1,
+                },
+            ],
+            metadata: {
+                userId: req.user.id,
+                email: user.email,
+                role,
+                plan: "pro",
+            },
+            subscription_data: {
+                metadata: {
+                    userId: req.user.id,
+                    email: user.email,
+                    role,
+                    plan: "pro",
+                },
+            },
+            success_url: `${frontendUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${frontendUrl}/payment/cancel`,
+        });
+
+        res.json({
+            success: true,
+            url: session.url,
+        });
+    } catch (error) {
+        console.error("Stripe checkout error:", error);
+
+        res.status(500).json({
+            success: false,
+            message: "Unable to create Stripe checkout session.",
+        });
+    }
+});
+
+
+// Stripe webhook
+app.post("/stripe/webhook", async (req, res) => {
+    console.log("Stripe webhook received:", req.headers["stripe-signature"] ? "Signature present" : "Signature missing");
+    console.log("Stripe configured:", !!stripe);
+    console.log("Webhook secret configured:", !!process.env.STRIPE_WEBHOOK_SECRET);
+    if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+        console.error("Stripe webhook configuration is missing.");
+        return res.status(500).send("Stripe webhook is not configured.");
+    }
+
+    let event;
+
+    try {
+        event = stripe.webhooks.constructEvent(
+            req.rawBody,
+            req.headers["stripe-signature"],
+            process.env.STRIPE_WEBHOOK_SECRET
+        );
+    } catch (error) {
+        console.error("Stripe webhook signature error:", error.message);
+        return res.status(400).send(`Webhook Error: ${error.message}`);
+    }
+
+    console.log("Stripe signature verified. Event type:", event.type);
+
+    try {
+        // Checkout completed: activate Pro
+        if (event.type === "checkout.session.completed") {
+            const session = event.data.object;
+
+            const email = session.metadata?.email || session.customer_details?.email;
+
+            const subscriptionId =
+                typeof session.subscription === "string"
+                    ? session.subscription
+                    : session.subscription?.id;
+
+            console.log("Checkout completed:", {
+                email,
+                subscriptionId,
+                userId: session.metadata?.userId,
+            });
+
+            if (email && subscriptionId) {
+                const result = await users().updateOne(
+                    { email },
+                    {
+                        $set: {
+                            plan: "pro",
+                            subscriptionPlan: "pro",
+                            stripeCustomerId: session.customer,
+                            stripeSubscriptionId: subscriptionId,
+                            subscriptionStatus: "active",
+                            updatedAt: new Date(),
+                        },
+                    }
+                );
+
+                console.log("User Pro update result:", {
+                    matchedCount: result.matchedCount,
+                    modifiedCount: result.modifiedCount,
+                });
+            } else {
+                console.error("Checkout metadata or subscription ID is missing.");
+            }
+        }
+
+        // Subscription changed or cancelled
+        if (
+            event.type === "customer.subscription.updated" ||
+            event.type === "customer.subscription.deleted"
+        ) {
+            const subscription = event.data.object;
+            const email = subscription.metadata?.email;
+            const status = subscription.status;
+            const isActive = ["active", "trialing"].includes(status);
+
+            if (email) {
+                await users().updateOne(
+                    { email },
+                    {
+                        $set: {
+                            plan: isActive ? "pro" : "free",
+                            subscriptionPlan: isActive ? "pro" : "free",
+                            subscriptionStatus: status,
+                            stripeSubscriptionId: subscription.id,
+                            updatedAt: new Date(),
+                        },
+                    }
+                );
+            }
+        }
+
+        // Record successful subscription invoices (including renewals)
+        if (event.type === "invoice.paid") {
+            const invoice = event.data.object;
+
+            const subscriptionId =
+                typeof invoice.subscription === "string"
+                    ? invoice.subscription
+                    : invoice.parent?.subscription_details?.subscription;
+
+            if (subscriptionId) {
+                const subscription = await stripe.subscriptions.retrieve(
+                    subscriptionId
+                );
+
+                const email = subscription.metadata?.email;
+                const user = email
+                    ? await users().findOne({ email })
+                    : null;
+
+                const existingPayment = await payments().findOne({
+                    stripeInvoiceId: invoice.id,
+                });
+
+                if (user && !existingPayment) {
+                    await payments().insertOne({
+                        userId: user._id.toString(),
+                        userName: user.name || user.fullName || "User",
+                        email: user.email,
+                        role: user.role,
+                        planName: `${user.role === "student" ? "Student" : "Tutor"} Pro`,
+                        amount: (invoice.amount_paid || 0) / 100,
+                        currency: invoice.currency || "usd",
+                        transactionId: invoice.payment_intent || invoice.id,
+                        stripeInvoiceId: invoice.id,
+                        stripeSubscriptionId: subscriptionId,
+                        sessionId: "",
+                        status: "paid",
+                        createdAt: new Date(
+                            (invoice.created || Math.floor(Date.now() / 1000)) * 1000
+                        ),
+                    });
+                }
+            }
+        }
+
+        res.json({ received: true });
+    } catch (error) {
+        console.error("Stripe webhook processing error:", error.message);
+        console.error(error.stack);
+        res.status(500).json({
+            success: false,
+            message: "Webhook processing failed.",
+        });
+    }
+});
+
 
 // Authentication middleware
 async function verifyToken(req, res, next) {
